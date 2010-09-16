@@ -433,8 +433,8 @@ clcv [options] lv
 
     clcv lv8888
     clcv http://nico.ms/lv8888
-    clcv http://live.nicovideo.jp/lv8888
-    clcv http://live.nicovideo.jp/lv8888?query_string
+    clcv http://live.nicovideo.jp/watch/lv8888
+    clcv http://live.nicovideo.jp/watch/lv8888?query_string
 
 =item B<--res-from>
 
