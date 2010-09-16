@@ -1,0 +1,454 @@
+#!perl
+
+# Notice:
+#   This application uses blocking IO intentionally.
+#   We assume that servers will respond as fast as possible.
+
+use strict;
+use warnings;
+use utf8;
+use Encode;
+
+use DBI;
+use YAML;
+use IO::Socket;
+use File::Path;
+use XML::Simple;
+use HTTP::Cookies;
+use LWP::UserAgent;
+use Web::Scraper;
+
+use Getopt::Long;
+use Pod::Usage;
+
+our $BASE_URL = 'http://live.nicovideo.jp';
+our $CONFBASE = "$ENV{HOME}/.clcv";
+our $DB_PATH  = "$CONFBASE/log.db";
+our $UNCOMMITTED_COUNT = 0;
+
+our %opt = (
+    res_from => '-5',
+    log      => '',
+    init     => '',
+    clear    => '',
+    lv       => '',
+);
+
+GetOptions(
+    "log"   => \$opt{log},
+    "init"  => \$opt{init},
+    "clear" => \$opt{clear},
+    '<>'    => sub {
+        if ($_[0]->{name} =~ /(lv\d+)/) {
+            $opt{lv} = $1
+        } else {
+            pod2usage(-verbose => 2);
+        }
+    },
+    "res-from:i" => sub {
+        $opt{res_from} = $_[1];
+        pod2usage(-verbose => 2) if $opt{res_from} > -1;
+    },
+);
+
+my $lv = $opt{lv};
+
+if ($opt{init}) {
+    &init; exit;
+} elsif ($opt{clear}) {
+    &_clear; exit;
+} elsif (!$lv) {
+    pod2usage(-verbose => 2);
+}
+
+pod2usage(-verbose => 2) unless -d "$CONFBASE";
+
+our $ua  = LWP::UserAgent->new(cookie_jar => &fetch_cookie_jar);
+our $dbh = DBI->connect("dbi:SQLite:dbname=$DB_PATH", '', '');
+$dbh->{AutoCommit} = 0;
+
+if ($opt{log}) {
+    show_log($lv);
+    exit;
+
+}
+
+my $ps = getplayerstatus($lv);
+#print encode_utf8(YAML::Dump($ps));
+
+printf "Title: %s (%s) %s thread: %s\n",
+    encode_utf8($ps->{stream}{title}), $ps->{stream}{id},
+    $ps->{stream}{default_community},  $ps->{ms}{thread};
+
+insert_into_live($ps);
+
+print "Connecting to server ($ps->{ms}{addr}:$ps->{ms}{port})...\n";
+my $ms = IO::Socket::INET->new(
+    Proto    => 'tcp',
+    PeerAddr => $ps->{ms}{addr},
+    PeerPort => $ps->{ms}{port},
+) or die $!;
+$ms->autoflush(1);
+
+print "Sending message...\n";
+my $thread_tag_attr = {
+    thread   => $ps->{ms}{thread},
+    version  => '20061206',
+    res_from => $opt{res_from},
+};
+print $ms XMLout($thread_tag_attr, RootName => 'thread') . "\0";
+
+print "Waiting response...\n", encode_utf8('─' x 80), "\n";
+{
+    local $/ = "\0";
+    while (my $line = <$ms>) {
+        chomp $line;
+        my $chat = XMLin($line);
+
+        if (defined $chat->{content}) {
+            if ($chat->{content} eq '/disconnect') {
+                insert_into_chat($chat, $ps->{stream}{id});
+                $dbh->commit;
+
+                print_chat($chat);
+                print encode_utf8("番組が終了しました\n");
+                last;
+
+            } else {
+                insert_into_chat($chat, $ps->{stream}{id});
+                if ($chat->{user_id} =~ /^\d+$/) {
+                    $chat->{user_name} = get_username($chat->{user_id});
+                }
+                print_chat($chat);
+            }
+
+        } else {
+            #print encode_utf8(YAML::Dump($chat));
+        }
+    }
+}
+
+exit;
+
+sub show_log {
+    my $lv = shift;
+
+    my $sth = $dbh->prepare(q{
+        SELECT *
+          FROM live
+         WHERE id = ?
+    });
+    $sth->execute($lv);
+
+    my $live = $sth->fetchrow_hashref;
+    
+    if (defined $live->{id}) {
+        print "$live->{title}($live->{id}) $live->{community_id}\n";
+        my $sth2 = $dbh->prepare(q{
+            SELECT *
+              FROM chat
+             WHERE liveid = ?
+             ORDER BY no ASC
+        });
+        $sth2->execute($live->{id});
+
+        while (my $chat = $sth2->fetchrow_hashref) {
+            for my $key (keys %$chat) {
+                $chat->{$key} = decode_utf8 $chat->{$key};
+            }
+
+            if ($chat->{user_id} =~ /^\d+$/) {
+                $chat->{user_name} = get_username($chat->{user_id});
+            }
+            print_chat($chat);
+        }
+
+    } else {
+        print "$lv is not found on this database\n";
+        exit;
+    }
+}
+
+sub insert_into_chat {
+    my $chat = shift;
+    my $liveid = shift;
+
+    # as integer
+    for my $key ( qw(anonymity date no premium thread vpos) ) {
+        $chat->{$key} = 0 unless defined $chat->{$key};
+    }
+
+    # as text
+    for my $key ( qw(content mail user_id) ) {
+        $chat->{$key} = "" unless defined $chat->{$key};
+    }
+
+    my $sth2 = $dbh->prepare(q{
+        SELECT *
+          FROM chat
+         WHERE liveid = ?
+           AND no =?
+    });
+    $sth2->execute($liveid, $chat->{no});
+    my $result = $sth2->fetchrow_hashref;
+
+    if (defined $result->{no}) {
+        return;
+    
+    } else {
+        my $sth = $dbh->prepare(q{
+            INSERT INTO chat (
+                liveid, anonymity, content, date, mail, 
+                no, premium, thread, user_id, vpos)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        });
+
+        $sth->execute(
+            $liveid,
+            $chat->{anonymity}, $chat->{content}, $chat->{date},
+            $chat->{mail},      $chat->{no},      $chat->{premium},
+            $chat->{thread},    $chat->{user_id}, $chat->{vpos}
+        );
+
+        if ($UNCOMMITTED_COUNT < 1000) {
+            $UNCOMMITTED_COUNT++;
+        } else {
+            $dbh->commit;
+        }
+
+    }
+
+}
+
+sub insert_into_live {
+    my $ps = shift;
+
+    my $sth2 = $dbh->prepare(q{SELECT * FROM live where id = ?});
+    $sth2->execute($ps->{stream}{id});
+    my $result = $sth2->fetchrow_hashref;
+
+    if (defined $result->{id}) {
+        return;
+
+    } else {
+        my $sth = $dbh->prepare(q{
+            INSERT INTO live (id, title, base_time, thread, community_id)
+            VALUES (?, ?, ?, ?, ?)
+        });
+        $sth->execute(
+            $ps->{stream}{id},        $ps->{stream}{title},
+            $ps->{stream}{base_time}, $ps->{ms}{thread},
+            $ps->{stream}{default_community}
+        );
+    }
+
+    $dbh->commit;
+}
+
+sub get_username {
+    my $userid = shift;
+
+    my $sth = $dbh->prepare(q{SELECT * from user where id = ?});
+    $sth->execute($userid);
+    my $row = $sth->fetchrow_hashref;
+
+    my $username;
+    if (defined $row->{name}) {
+        $username = decode_utf8($row->{name});
+
+    } else {
+        $username = scrape_username($userid);
+
+        if ($username ne "ERROR") {
+            my $sth = $dbh->prepare(q{INSERT INTO user (id, name) values(?, ?)});
+            $sth->execute($userid, $username);
+            $dbh->commit;
+        }
+    }
+
+    return $username;
+}
+
+sub scrape_username {
+    my $userid = shift;
+    my $base = 'http://www.nicovideo.jp/user';
+
+    my $userpage = scraper {
+        process '//title', title => 'TEXT';};
+
+    my $page = $userpage->scrape(
+        $ua->get("$base/$userid")->decoded_content);
+
+    return ($page->{title} =~ /^(.+)さんのユーザーページ/) ? $1 : " $base/$userid ";
+}
+
+sub print_chat {
+    my $chat = shift;
+
+    $chat->{content} =~ s/\r|\n//g;
+    $chat->{content} = substr($chat->{content}, 0, 60);
+
+    if (length($chat->{user_id}) > 15) {
+        $chat->{user_id} = substr($chat->{user_id}, 0, 12) . '...';
+    }
+
+    if (defined $chat->{user_name}) {
+        $chat->{content} .= " (\@$chat->{user_name})";
+    }
+
+    print encode_utf8(
+        sprintf("%5s │ %-15s │ %s\n",
+            $chat->{no}, $chat->{user_id}, $chat->{content}));
+}
+
+sub getplayerstatus {
+    my $lv = shift;
+    my $api = "$BASE_URL/api/getplayerstatus?v=$lv";
+
+    my $status = XMLin $ua->get($api)->content;
+    if ($status->{status} eq 'ok') {
+        return $status;
+    } else {
+        print "$status->{status}: $status->{error}{code}\n";
+        exit;
+    }
+}
+
+sub fetch_cookie_jar {
+    my $file = "$ENV{HOME}/.config/chromium/Default/Cookies";
+
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$file", '', '');
+    my $sth = $dbh->prepare(q{
+        SELECT *
+          FROM cookies
+         WHERE host_key = '.nicovideo.jp'
+           AND name     = 'user_session'
+    });
+    $sth->execute;
+
+    my $result = $sth->fetchall_hashref('name');
+    my $s = $result->{user_session};
+
+    my $cookie_jar = HTTP::Cookies->new;
+    $cookie_jar->set_cookie(
+        undef, $s->{name}, $s->{value}, $s->{path}, $s->{host_key},
+        undef, undef, $s->{secure}, $s->{expires_utc}, 0, {}
+    );
+
+    return $cookie_jar;
+}
+
+sub init {
+    print "Initializing...\n";
+
+    unless (-d $CONFBASE) {
+        print "Creating base directory: $CONFBASE\n";
+        mkdir $CONFBASE;
+    }
+
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$DB_PATH", '', '');
+
+    print "Creating databases: $DB_PATH\n";
+    my $sth = $dbh->prepare(q{
+        CREATE TABLE IF NOT EXISTS chat (
+            liveid    VARCHAR(32) NOT NULL,
+            anonymity INTEGER,
+            content   TEXT    NOT NULL,
+            date      INTEGER NOT NULL,
+            mail      TEXT,
+            no        INTEGER NOT NULL,
+            premium   INTEGER,
+            thread    INTEGER NOT NULL,
+            user_id   TEXT    NOT NULL,
+            vpos      INTEGER NOT NULL
+        )
+    });
+    $sth->execute;
+
+    my $sth2 = $dbh->prepare(q{
+        CREATE TABLE IF NOT EXISTS live (
+            id        VARCHAR(32)  PRIMARY KEY NOT NULL,
+            title     VARCHAR(128) NOT NULL,
+            base_time INTEGER NOT NULL,
+            thread    INTEGER NOT NULL,
+            community_id VARCHAR(32) NOT NULL
+        )
+    });
+    $sth2->execute;
+
+    my $sth3 = $dbh->prepare(q{
+        CREATE TABLE user (
+            id   VARCHAR(64) PRIMARY KEY NOT NULL,
+            name VARCHAR(128)
+        )
+    });
+    $sth3->execute;
+
+    my $sth4 = $dbh->prepare(q{
+        CREATE TABLE community (
+            id   VARCHAR(12)  PRIMARY KEY NOT NULL,
+            name VARCHAR(128) NOT NULL
+        )
+    });
+    $sth4->execute;
+
+    $dbh->commit;
+
+    print "Done.\n";
+}
+
+sub _clear {
+    File::Path::remove_tree("$CONFBASE", {verbose => 1});
+}
+
+__END__
+
+=head1 NAME
+
+clcv - CLI Comment Viewer
+
+=head1 SYNOPSIS
+
+=head2 INITIALIZE
+
+clcv --init
+
+=head2 VIEW COMMENT
+
+clcv [options] lv
+
+    lv:
+        live number
+        
+    Options:
+        --res-from  Specify how many comment to trace back to the past.
+        --log       View comment in log mode.
+
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<lv>
+
+    clcv lv8888
+    clcv http://nico.ms/lv8888
+    clcv http://live.nicovideo.jp/lv8888
+    clcv http://live.nicovideo.jp/lv8888?query_string
+
+=item B<--res-from>
+
+    Specify how many comment to trace back to the past.
+    Default is -5. The value must be minus.
+
+=item B<--log>
+
+    clcv lv8888 --log
+
+    Appending this option turns mode into viewing log.
+    Acceptable B<lv> argument is the same as above.
+
+=back
+
+=cut
+
