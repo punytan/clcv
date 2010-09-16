@@ -1,4 +1,4 @@
-#!perl
+#!/usr/bin/perl
 
 # Notice:
 #   This application uses blocking IO intentionally.
@@ -45,6 +45,7 @@ GetOptions(
             pod2usage(-verbose => 2);
         }
     },
+
     "res-from:i" => sub {
         $opt{res_from} = $_[1];
         pod2usage(-verbose => 2) if $opt{res_from} > -1;
@@ -69,66 +70,69 @@ $dbh->{AutoCommit} = 0;
 
 if ($opt{log}) {
     show_log($lv);
-    exit;
 
-}
-
-my $ps = getplayerstatus($lv);
-#print encode_utf8(YAML::Dump($ps));
-
-printf "Title: %s (%s) %s thread: %s\n",
-    encode_utf8($ps->{stream}{title}), $ps->{stream}{id},
-    $ps->{stream}{default_community},  $ps->{ms}{thread};
-
-insert_into_live($ps);
-
-print "Connecting to server ($ps->{ms}{addr}:$ps->{ms}{port})...\n";
-my $ms = IO::Socket::INET->new(
-    Proto    => 'tcp',
-    PeerAddr => $ps->{ms}{addr},
-    PeerPort => $ps->{ms}{port},
-) or die $!;
-$ms->autoflush(1);
-
-print "Sending message...\n";
-my $thread_tag_attr = {
-    thread   => $ps->{ms}{thread},
-    version  => '20061206',
-    res_from => $opt{res_from},
-};
-print $ms XMLout($thread_tag_attr, RootName => 'thread') . "\0";
-
-print "Waiting response...\n", encode_utf8('─' x 80), "\n";
-{
-    local $/ = "\0";
-    while (my $line = <$ms>) {
-        chomp $line;
-        my $chat = XMLin($line);
-
-        if (defined $chat->{content}) {
-            if ($chat->{content} eq '/disconnect') {
-                insert_into_chat($chat, $ps->{stream}{id});
-                $dbh->commit;
-
-                print_chat($chat);
-                print encode_utf8("番組が終了しました\n");
-                last;
-
-            } else {
-                insert_into_chat($chat, $ps->{stream}{id});
-                if ($chat->{user_id} =~ /^\d+$/) {
-                    $chat->{user_name} = get_username($chat->{user_id});
-                }
-                print_chat($chat);
-            }
-
-        } else {
-            #print encode_utf8(YAML::Dump($chat));
-        }
-    }
+} else {
+    recv_comment();
 }
 
 exit;
+
+sub recv_comment {
+    my $ps = getplayerstatus($lv);
+    #print encode_utf8(YAML::Dump($ps));
+
+    printf "Title: %s (%s) %s thread: %s\n",
+        encode_utf8($ps->{stream}{title}), $ps->{stream}{id},
+        $ps->{stream}{default_community},  $ps->{ms}{thread};
+
+    insert_into_live($ps);
+
+    print "Connecting to server ($ps->{ms}{addr}:$ps->{ms}{port})...\n";
+    my $ms = IO::Socket::INET->new(
+        Proto    => 'tcp',
+        PeerAddr => $ps->{ms}{addr},
+        PeerPort => $ps->{ms}{port},
+    ) or die $!;
+    $ms->autoflush(1);
+
+    print "Sending message...\n";
+    my $thread_tag_attr = {
+        thread   => $ps->{ms}{thread},
+        version  => '20061206',
+        res_from => $opt{res_from},
+    };
+    print $ms XMLout($thread_tag_attr, RootName => 'thread') . "\0";
+
+    print "Waiting response...\n", encode_utf8('─' x 80), "\n";
+    {
+        local $/ = "\0";
+        while (my $line = <$ms>) {
+            chomp $line;
+            my $chat = XMLin($line);
+
+            if (defined $chat->{content}) {
+                if ($chat->{content} eq '/disconnect') {
+                    insert_into_chat($chat, $ps->{stream}{id});
+                    $dbh->commit;
+
+                    print_chat($chat);
+                    print encode_utf8("番組が終了しました\n");
+                    last;
+
+                } else {
+                    insert_into_chat($chat, $ps->{stream}{id});
+                    if ($chat->{user_id} =~ /^\d+$/) {
+                        $chat->{user_name} = get_username($chat->{user_id});
+                    }
+                    print_chat($chat);
+                }
+
+            } else {
+                #print encode_utf8(YAML::Dump($chat));
+            }
+        }
+    }
+}
 
 sub show_log {
     my $lv = shift;
