@@ -263,7 +263,7 @@ sub get_username {
     } else {
         $username = scrape_username($userid);
 
-        if ($username ne "ERROR") {
+        if ($username !~ m!/user/!) {
             my $sth = $dbh->prepare(q{INSERT INTO user (id, name) values(?, ?)});
             $sth->execute($userid, $username);
             $dbh->commit;
