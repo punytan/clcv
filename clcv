@@ -443,7 +443,7 @@ clcv [options] lv
 =item B<--res-from>
 
     Specify how many comment to trace back to the past.
-    Default is -5. The value must be minus.
+    Default is -5. The value must be negative value.
 
 =item B<--log>
 
